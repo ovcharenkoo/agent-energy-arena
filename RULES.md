@@ -147,6 +147,11 @@ hourly_factor(h):
 
 Industrial tiles draw their full `demand_kw` continuously. Commercial tiles draw full `demand_kw` between 08:00 and 20:00, 20% otherwise. Injection wells and refineries add their process load (computed from yesterday's throughput so dispatch is causal).
 
+Automated Demand Response Hubs coordinate flexible civilian loads. Each
+operational hub reduces residential + commercial + industrial demand by 15%
+from 09:00 through 19:59, with a city-wide cap of 30%. Process loads from wells
+and refineries are not reduced.
+
 Multipliers (state-mutable, scenario-targetable):
 
 - Heatwave multiplies residential demand by 1.40 while `heatwave` is active.
