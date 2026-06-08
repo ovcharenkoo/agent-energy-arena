@@ -14,7 +14,7 @@ PYTHON ?= $(shell \
 # Interpreter used to create .venv. Must satisfy requires-python (>=3.11);
 # macOS system python3 is 3.9, so pick the first available 3.11+ binary.
 VENV_PYTHON ?= $(shell \
-	for py in python3.13 python3.12 python3.11 python3; do \
+	for py in python3.14 python3.13 python3.12 python3.11 python3; do \
 		if command -v $$py >/dev/null 2>&1; then echo $$py; break; fi; \
 	done)
 

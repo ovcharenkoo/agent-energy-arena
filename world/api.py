@@ -12,6 +12,7 @@ import importlib
 import inspect
 import json
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -289,8 +290,20 @@ def create_app(
     if world is None:
         world = World(runs_root=runs_root, run_prefix="play", seed_starter_grid=True)
     if action_log is None:
-        run_id = world.recorder.run_id if world.recorder is not None else None
-        action_log = ActionLog(root=runs_root, run_id=run_id)
+        if world.recorder is not None:
+            # Co-locate actions.jsonl with the recorder so a single run
+            # directory holds every artifact for the session, sharing the
+            # recorder's readable `<prefix>-<timestamp>` folder name.
+            action_log = ActionLog(root=runs_root, run_id=world.recorder.run_id)
+        else:
+            # The world was built with `runs_root=None` — it deliberately
+            # keeps no on-disk run folder (tests, library use). An action
+            # log with no recorder to anchor it must NOT materialize into
+            # the canonical `runs/` root, or every mutating-endpoint test
+            # would litter it with stray `<epoch>-<uuid>` directories.
+            # Route it to a throwaway temp root that mirrors the world's
+            # "no persistence" intent.
+            action_log = ActionLog(root=Path(tempfile.gettempdir()) / "aea-ephemeral-runs")
     app.state.world = world
     app.state.action_log = action_log
     # When the world owns a recorder, /reset reallocates the run folder

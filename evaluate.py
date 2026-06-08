@@ -1,4 +1,31 @@
-"""evaluate.py — CLI driver for AFK evaluation and scoring.
+"""evaluate_v2.py — experimental duplicate of evaluate.py for score A/B.
+
+Identical CLI and behaviour to evaluate.py, with two scoring changes so
+you can run both side by side and compare the result lines by eye:
+
+  1. Horizon consistency. `time_scaled_score` normalizes against the
+     2-year longevity goal (LONGEVITY_TARGET_DAYS, 730) — the same
+     horizon world/scoring.py treats as "complete" — instead of the
+     full 3650-day game_days. A run that reaches the goal within budget
+     keeps its full score; one cut off earlier is scaled by how far
+     toward 2 years it got.
+
+  2. Representativeness. Alongside the shipped `score`, the result line
+     carries two alternative measures computed from the SAME component
+     breakdown, so a run that is insolvent / depopulated most of the
+     game scores like the bad run it is:
+       - `score_reweight`: base-term weights shifted off longevity and
+         renewable-share toward treasury / population / solvency.
+       - `score_viability`: the baseline score gated by a
+         solvency x population viability index (necessary conditions,
+         not just weighted terms).
+     Each gets its own `time_scaled_*` field using the 730-day horizon.
+
+Original evaluate.py is untouched; compare its line to this one.
+
+---
+
+CLI driver for AFK evaluation and scoring.
 
 Two modes:
 
@@ -53,7 +80,7 @@ from agents.api_client import ApiClient, BudgetExpired  # noqa: E402
 from agents.base import BaseAgent  # noqa: E402
 from world.api import create_app  # noqa: E402
 from world.config import load_config  # noqa: E402
-from world.scoring import compute_score  # noqa: E402
+from world.scoring import LONGEVITY_TARGET_DAYS, compute_score  # noqa: E402
 from world.sim import World  # noqa: E402
 
 
@@ -295,6 +322,51 @@ class _ProgressBar:
         sys.stderr.flush()
 
 
+# --- Alternative scoring measures (v2 only) ---------------------------------
+#
+# Both recombine the component breakdown `compute_score` already returns,
+# so they stay in lockstep with the canonical per-axis math and differ
+# only in how the components are AGGREGATED into a headline.
+
+# `score_reweight` weights: shifted from the shipped
+# (0.30/0.30/0.10/0.20/0.10 base, 0.15 longevity) to put fiscal +
+# demographic health in the driver's seat. The five base weights sum to
+# 1.0; longevity is cut to 0.05 so survival-days can't carry a broken run.
+_RW_AXIS_TREASURY = 0.30
+_RW_AXIS_POP = 0.30
+_RW_AXIS_HAPPY = 0.05
+_RW_R = 0.10
+_RW_SOLVENCY = 0.25
+_RW_LONGEVITY = 0.05
+
+# `score_viability` gate: a run earns full credit only once it is solvent
+# on _SOLVENCY_FULL of days AND sustains _POP_LEVEL_FULL of the population
+# target on average. Each factor ramps to 1.0 at its threshold; the two
+# multiply, so a run broke OR empty most of the game is pulled toward zero.
+_SOLVENCY_FULL = 0.80
+_POP_LEVEL_FULL = 0.50
+
+
+def _score_reweight(components: dict[str, Any]) -> float:
+    """Headline in [0, 100] from baseline components, fundamentals-first."""
+    base = (
+        _RW_AXIS_TREASURY * components["axis_treasury"]
+        + _RW_AXIS_POP * components["axis_pop"]
+        + _RW_AXIS_HAPPY * components["axis_happy"]
+        + _RW_R * components["R"]
+        + _RW_SOLVENCY * components["solvency"]
+    )
+    headline = 100.0 * ((1.0 - _RW_LONGEVITY) * base + _RW_LONGEVITY * components["longevity"])
+    return max(0.0, min(100.0, headline))
+
+
+def _score_viability(baseline_score: float, components: dict[str, Any]) -> float:
+    """Baseline score gated by a solvency x population viability index."""
+    solvency_factor = min(1.0, components["solvency"] / _SOLVENCY_FULL)
+    pop_factor = min(1.0, components["level_pop"] / _POP_LEVEL_FULL)
+    return max(0.0, min(100.0, baseline_score * solvency_factor * pop_factor))
+
+
 # --- Commands ---------------------------------------------------------------
 
 
@@ -401,23 +473,32 @@ def cmd_eval(
     )
 
     score_payload = api.score()
+    raw_score = float(score_payload.get("score", 0.0))
+    components = score_payload.get("components", {})
+    # v2 alternative measures, recombined from the same components.
+    score_reweight = _score_reweight(components) if components else 0.0
+    score_viability = _score_viability(raw_score, components) if components else 0.0
     line: dict[str, Any] = {
         "agent": module_name,
         "seed": seed,
         "run_id": run_dir.name,
         "score": score_payload,
+        "score_reweight": score_reweight,
+        "score_viability": score_viability,
     }
     if time_budget is not None:
-        # `active_game_days` reflects scenario overrides; falls back to
-        # the static config when no scenario shrinks the horizon.
-        config = final_state.get("config", {})
-        game_days = int(config.get("active_game_days") or config.get("game_days") or 1)
         days_advanced = int(final_state.get("day", 0))
-        raw_score = float(score_payload.get("score", 0.0))
+        # v2 horizon fix: scale against the 2-year longevity goal
+        # (LONGEVITY_TARGET_DAYS), capped at 1.0 — the same horizon
+        # world/scoring.py treats as complete — not the full game_days.
+        goal_fraction = min(1.0, days_advanced / LONGEVITY_TARGET_DAYS)
         line["time_budget_seconds"] = int(time_budget)
         line["wall_time_seconds"] = wall_time_seconds
         line["days_advanced"] = days_advanced
-        line["time_scaled_score"] = raw_score * days_advanced / game_days
+        line["longevity_target_days"] = LONGEVITY_TARGET_DAYS
+        line["time_scaled_score"] = raw_score * goal_fraction
+        line["time_scaled_reweight"] = score_reweight * goal_fraction
+        line["time_scaled_viability"] = score_viability * goal_fraction
     if recorder is not None:
         line["llm_metrics"] = recorder.summary()
     print(json.dumps(line))

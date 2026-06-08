@@ -50,7 +50,14 @@ class ActionLog:
 
 
 def _new_run_id() -> str:
-    return f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    """Fallback folder name for an ActionLog with no recorder to anchor it.
+
+    Matches the recorder's readable ``<prefix>-<YYYYMMDD-HHMMSS>`` scheme
+    (with a uuid tail for same-second uniqueness) so a standalone log never
+    produces an opaque ``<epoch>-<uuid>`` directory. In the normal server
+    path the log inherits the recorder's run id and this is never reached.
+    """
+    return f"run-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
 
 def _json_default(obj: Any) -> Any:

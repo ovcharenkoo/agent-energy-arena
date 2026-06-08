@@ -12,11 +12,29 @@ decision: did the local critic veto every proposed mutation? If so,
 re-prompt the model once with the rejection reasons; otherwise advance
 to `execute`. The re-plan retry is capped at 1 per turn.
 
-Two extension surfaces are documented for hackathon participants:
+Three deterministic overlays wrap the LLM (CLI / `play_game` only — the
+attach path in `act()` is unchanged):
+
+  - `OPENING_BOOK` — a fixed city layout built on day 0 with no LLM call.
+  - Renewable-drought throttle — when the next-day `/forecast` shows both
+    weak sun and weak wind, every well and refinery is parked at 0 for the
+    turn to keep the day off fossil backup.
+  - Coal-failure oil shutdown — when a coal plant fails, all production
+    wells are parked at 0 for a week.
+
+The last two live in `_deterministic_policy`; their forced setpoints
+bypass the critic and are applied in `_execute` after the LLM's surviving
+calls. Throttling is one-way (loads only go *down*); restoring rates is
+left to the LLM, which sees the parked setpoints in the state summary.
+
+Extension surfaces documented for hackathon participants:
 
   1. The module-level `RULES = [...]` list of critic functions.
      Append a new pure function `rule(call, state_view)` to add a check.
-  2. The rejection-reason prompt construction inside `_plan`. Tune the
+  2. `_OPENING_LAYOUT` / `_deterministic_policy` plus the thresholds
+     (`SOLAR_PEAK_LOW`, `WIND_MEAN_LOW`, `OIL_SHUTDOWN_DAYS`) — tune the
+     deterministic policy.
+  3. The rejection-reason prompt construction inside `_plan`. Tune the
      framing the model receives on the re-plan pass.
 
 The critic is a fast local pre-flight check, not a second source of
@@ -58,9 +76,57 @@ MAX_TOKENS_PER_TURN: int = 2048
 FORECAST_HOURS: int = 24
 MAX_REPLAN_RETRIES: int = 1
 
+# Deterministic-policy knobs (see `_deterministic_policy` + `OPENING_BOOK`).
+OPENING_STEP_DAYS: int = (
+    1  # step after laying the day-0 opening, so the LLM re-plans the morning after.
+)
+OIL_SHUTDOWN_DAYS: int = 7  # length of the post-coal-failure oil-extraction shutdown ("a week").
+THROTTLED_RATE_BBL_DAY: float = 0.0  # setpoint a throttled well/refinery is parked at.
+SOLAR_PEAK_LOW: float = 0.5  # next-day peak irradiance below this reads as an overcast day.
+WIND_MEAN_LOW: float = 4.0  # next-day mean wind (m/s) below this is near the ~3 m/s turbine cut-in.
+
 MUTATOR_TOOLS: frozenset[str] = frozenset(
     {"build", "demolish", "survey", "drill", "set_well_rate", "set_refinery_rate"}
 )
+
+# ---------- Day-0 opening book ---------------------------------------------
+#
+# A fixed city layout laid down deterministically on day 0 (no LLM call).
+# Edit `_OPENING_LAYOUT` to change the opening; roads are listed before the
+# tiles that need road adjacency, and `_execute` dispatches in order, so the
+# network exists by the time the houses/commercial/industrial land. Every
+# coordinate is validated against the live world by `_critique` (bounds +
+# occupancy) and by `World.build` server-side, so a bad entry is dropped, not
+# fatal.
+_OPENING_LAYOUT: tuple[tuple[str, int, int], ...] = (
+    ("road", 16, 15),
+    ("road", 16, 14),
+    ("road", 16, 13),
+    ("road", 16, 12),
+    ("road", 17, 16),
+    ("road", 18, 16),
+    ("road", 19, 16),
+    ("road", 19, 14),
+    ("road", 19, 15),
+    ("road", 19, 13),
+    ("road", 19, 12),
+    ("house", 17, 15),
+    ("house", 18, 15),
+    ("house", 18, 14),
+    ("house", 18, 13),
+    ("house", 17, 13),
+    ("park", 17, 12),
+    ("park", 18, 12),
+    ("commercial", 17, 14),
+    ("wind_turbine", 1, 30),
+    ("wind_turbine", 3, 30),
+    ("industrial", 9, 15),
+    ("road", 19, 11),
+    ("road", 19, 10),
+)
+OPENING_BOOK: list[ToolCall] = [
+    ToolCall("build", {"tile_type": t, "x": x, "y": y}) for (t, x, y) in _OPENING_LAYOUT
+]
 
 
 class GraphState(TypedDict, total=False):
@@ -72,11 +138,13 @@ class GraphState(TypedDict, total=False):
     forecast: list[dict[str, Any]] | None
     pending_calls: list[ToolCall]
     survivors: list[ToolCall]
+    forced_calls: list[ToolCall]
     rejections: list[str]
     step_days: int
     cumulative_tokens: int
     turn: int
     replan_retries: int
+    oil_shutdown_until_day: int
 
 
 # ---------- Critic rules ---------------------------------------------------
@@ -126,6 +194,108 @@ def tile_occupied(call: ToolCall, state_view: dict[str, Any]) -> str | None:
 RULES: list[RuleFn] = [out_of_bounds, tile_occupied]
 
 
+# ---------- Deterministic policy -------------------------------------------
+#
+# Two rule-based overrides that bypass the LLM and the critic: they read the
+# `/state` + `/forecast` snapshot and force well/refinery setpoints. The LLM
+# still proposes builds and step size; these only ever turn power-hungry oil
+# loads *down*. See `_deterministic_policy` for how they compose.
+
+
+def _renewables_low(forecast: list[dict[str, Any]] | None) -> bool:
+    """True when the next-day forecast shows BOTH weak sun and weak wind.
+
+    `solar_irradiance` is 0 overnight, so we gate on the daytime *peak*
+    (max over the horizon) — a peak below `SOLAR_PEAK_LOW` means an
+    overcast day. Wind gates on the horizon *mean*; below `WIND_MEAN_LOW`
+    (~the 3 m/s turbine cut-in) the turbines barely turn. Both must be low
+    to throttle: a windy-but-cloudy day still has renewable headroom."""
+    if not forecast:
+        return False
+    solar = [float(f.get("solar_irradiance", 0.0)) for f in forecast]
+    wind = [float(f.get("wind_speed_mps", 0.0)) for f in forecast]
+    if not solar or not wind:
+        return False
+    return max(solar) < SOLAR_PEAK_LOW and (sum(wind) / len(wind)) < WIND_MEAN_LOW
+
+
+def _coal_plant_failed(obs: dict[str, Any]) -> bool:
+    """True when an active `plant_failure` event names a coal-plant tile.
+
+    The event payload carries only `plant_id` (not the plant type), so we
+    resolve it against `/state.tiles`. Detection is by *active failure*,
+    not `started_day == today`: the agent may advance several days per
+    turn and would otherwise miss a failure that began mid-window."""
+    tiles = obs.get("tiles") or []
+    coal_ids = {t.get("id") for t in tiles if t.get("type") == "coal_plant"}
+    if not coal_ids:
+        return False
+    return any(
+        e.get("type") == "plant_failure" and e.get("plant_id") in coal_ids
+        for e in obs.get("active_events") or []
+    )
+
+
+def _deterministic_policy(
+    obs: dict[str, Any],
+    forecast: list[dict[str, Any]] | None,
+    day: int,
+    shutdown_until: int,
+) -> tuple[list[ToolCall], int]:
+    """Forced well/refinery setpoints from two rules, plus the (possibly
+    extended) oil-shutdown deadline.
+
+    Rule C (coal failure → shut oil for a week): when a coal plant is down
+    and we're not already inside a shutdown window, park every *production*
+    well at 0 for `OIL_SHUTDOWN_DAYS`. The window is re-armed every turn it
+    stays active, so it survives multi-day steps; it auto-expires once
+    `day >= shutdown_until`.
+
+    Rule B (renewable drought → cut discretionary load): when BOTH sun and
+    wind are forecast low, park every well *and* refinery at 0 for the
+    turn. These are the grid's biggest controllable loads (injection 50,
+    production 15, refinery 200 kWh/bbl), so parking them keeps a
+    low-renewable day off fossil backup.
+
+    Throttling is one-way — the policy only turns loads *down*. Restoring
+    rates after the sky clears or the week ends is left to the LLM, which
+    sees the parked setpoints in the state summary. Setpoints already at
+    target are skipped, so a long shutdown doesn't spam the action log."""
+    wells = obs.get("wells") or []
+    refineries = [t for t in (obs.get("tiles") or []) if t.get("type") == "refinery"]
+
+    if _coal_plant_failed(obs) and day >= shutdown_until:
+        shutdown_until = day + OIL_SHUTDOWN_DAYS
+    oil_shut = day < shutdown_until
+    renewables_low = _renewables_low(forecast)
+
+    well_targets: dict[str, float] = {}
+    if oil_shut:
+        for w in wells:
+            if w.get("type") == "production":
+                well_targets[str(w.get("id"))] = THROTTLED_RATE_BBL_DAY
+    if renewables_low:
+        for w in wells:
+            well_targets[str(w.get("id"))] = THROTTLED_RATE_BBL_DAY  # incl. injection
+
+    refinery_targets: dict[str, float] = {}
+    if renewables_low:
+        for r in refineries:
+            refinery_targets[str(r.get("id"))] = THROTTLED_RATE_BBL_DAY
+
+    forced: list[ToolCall] = []
+    cur_well = {str(w.get("id")): w.get("setpoint_rate_bbl_day") for w in wells}
+    for wid, rate in well_targets.items():
+        if cur_well.get(wid) != rate:
+            forced.append(ToolCall("set_well_rate", {"well_id": wid, "rate_bbl_day": rate}))
+    cur_ref = {str(r.get("id")): r.get("setpoint_rate_bbl_day") for r in refineries}
+    for rid, rate in refinery_targets.items():
+        if cur_ref.get(rid) != rate:
+            forced.append(ToolCall("set_refinery_rate", {"refinery_id": rid, "rate_bbl_day": rate}))
+
+    return forced, shutdown_until
+
+
 # ---------- Agent ----------------------------------------------------------
 
 
@@ -134,9 +304,12 @@ class LangGraphAgent(BaseAgent):
     (`__init__(api, *, seed=None)` + `play_game() -> dict`).
 
     Subclasses `BaseAgent` so the Agent Play attach handler accepts it.
-    `act(state)` delegates to the shared attach runtime so attach-mode
-    behavior matches `LLMReactAgent` exactly. The graph itself only
-    runs in CLI mode (`play_game()`).
+    The compiled graph only runs in CLI mode (`play_game()`); attach mode
+    (`act(state)`, driven by the UI's `/step`) delegates the LLM turn to
+    the shared attach runtime. The three deterministic overlays — the
+    day-0 `OPENING_BOOK`, the renewable-drought throttle, and the
+    coal-failure oil shutdown — run in BOTH modes, so an attached agent
+    lays the same opening and applies the same policy as the CLI run.
     """
 
     def __init__(
@@ -158,11 +331,29 @@ class LangGraphAgent(BaseAgent):
         self.cumulative_tokens: int = 0
         self.turns: int = 0
         self.final_score: dict[str, Any] | None = None
+        # Attach-mode policy state (the graph threads its own copies through
+        # GraphState; attach mode keeps them on the instance instead).
+        self._opening_done: bool = False
+        self._oil_shutdown_until_day: int = 0
         self.graph = self._build_graph()
 
     # -- Attach hook ------------------------------------------------------
 
     def act(self, state: dict[str, Any]) -> int | None:
+        """Per-`/step` attach hook. Runs the same deterministic overlays as
+        the graph: lay the day-0 opening once (no LLM call), then on later
+        days take the LLM turn and apply the forced well/refinery throttles
+        on top. `api.step` is forbidden in attach mode, so the day-0 path
+        returns `None` ("wake me next step") rather than advancing time."""
+        day = int(state.get("day", 0))
+        forecast = _safe_forecast(self.api)
+
+        # Day 0: lay the opening book deterministically, exactly once.
+        if day == 0 and not self._opening_done:
+            self._opening_done = True
+            self._dispatch_all(OPENING_BOOK)
+            return None
+
         usage, skip_days = drive_one_turn(
             self.api,
             state,
@@ -172,7 +363,24 @@ class LangGraphAgent(BaseAgent):
             max_tokens=self.max_tokens_per_turn,
         )
         self.cumulative_tokens += usage.total
+
+        # Apply deterministic throttles AFTER the LLM turn so they override
+        # any well/refinery rate the model just set.
+        forced, self._oil_shutdown_until_day = _deterministic_policy(
+            state, forecast, day, self._oil_shutdown_until_day
+        )
+        self._dispatch_all(forced)
         return skip_days
+
+    def _dispatch_all(self, calls: list[ToolCall]) -> None:
+        """Dispatch each call, swallowing unknown names, world-side
+        rejections, and malformed args so one bad call doesn't crash the
+        turn. Shared by `act` (attach) and `_execute` (graph)."""
+        for call in calls:
+            try:
+                dispatch_tool_call(self.api, call)
+            except (RuntimeError, KeyError, TypeError, ValueError):
+                continue
 
     # -- Graph construction ----------------------------------------------
 
@@ -230,6 +438,7 @@ class LangGraphAgent(BaseAgent):
                 "cumulative_tokens": 0,
                 "turn": 0,
                 "replan_retries": 0,
+                "oil_shutdown_until_day": 0,
             },
             config={"recursion_limit": recursion_limit},
         )
@@ -260,9 +469,38 @@ class LangGraphAgent(BaseAgent):
         }
 
     def _plan(self, state: GraphState) -> GraphState:
-        """One LLM call. On a re-plan pass, prepend the rejection reasons
-        from `critique` so the model sees what the local critic vetoed."""
-        user_msg = summarize_state(state.get("obs") or {}, state.get("forecast"))
+        """Propose this turn's calls. Two deterministic overlays wrap the
+        LLM here:
+
+          - Day 0 lays the fixed `OPENING_BOOK` with no LLM call at all.
+          - Every turn, `_deterministic_policy` computes `forced_calls`
+            (well/refinery throttles) that bypass the critic in `_execute`.
+
+        On a re-plan pass, the rejection reasons from `critique` are
+        prepended so the model sees what the local critic vetoed."""
+        day = int(state.get("day", 0))
+        obs = state.get("obs") or {}
+        forecast = state.get("forecast")
+        game_days = int(state.get("game_days", 0))
+        retries = int(state.get("replan_retries", 0))
+
+        forced, shutdown_until = _deterministic_policy(
+            obs, forecast, day, int(state.get("oil_shutdown_until_day", 0))
+        )
+
+        # Day 0: lay the opening book deterministically — skip the LLM.
+        if day == 0:
+            return {
+                "pending_calls": list(OPENING_BOOK),
+                "forced_calls": forced,
+                "step_days": min(OPENING_STEP_DAYS, max(1, game_days - day)),
+                "turn": int(state.get("turn", 0)) + 1,
+                "rejections": [],
+                "replan_retries": retries,
+                "oil_shutdown_until_day": shutdown_until,
+            }
+
+        user_msg = summarize_state(obs, forecast)
         rejections = state.get("rejections") or []
         if rejections:
             bullets = "\n".join(f"- {r}" for r in rejections)
@@ -286,20 +524,21 @@ class LangGraphAgent(BaseAgent):
                 break  # step terminates the turn — ignore anything after it
             pending.append(call)
 
-        remaining = max(1, state.get("game_days", 0) - state.get("day", 0))
+        remaining = max(1, game_days - day)
         step_days = min(step_days, remaining)
 
-        retries = int(state.get("replan_retries", 0))
         if rejections:
             retries += 1
 
         return {
             "pending_calls": pending,
+            "forced_calls": forced,
             "step_days": step_days,
             "cumulative_tokens": int(state.get("cumulative_tokens", 0)) + response.usage.total,
             "turn": int(state.get("turn", 0)) + 1,
             "rejections": [],
             "replan_retries": retries,
+            "oil_shutdown_until_day": shutdown_until,
         }
 
     def _critique(self, state: GraphState) -> GraphState:
@@ -341,18 +580,17 @@ class LangGraphAgent(BaseAgent):
         return "execute"
 
     def _execute(self, state: GraphState) -> GraphState:
-        """Dispatch each survivor through the shared `dispatch_tool_call`.
-        Unknown tool names return `None` from the dispatcher and are
+        """Dispatch each survivor, then the deterministic `forced_calls`,
+        through the shared `dispatch_tool_call`. Survivors run first so an
+        LLM `set_well_rate` is overridden by a policy throttle on the same
+        well. Unknown tool names return `None` from the dispatcher and are
         silently skipped; world-side rejections (`RuntimeError` from the
         4xx envelope) and malformed args are swallowed so a single bad
-        LLM call doesn't crash the turn."""
+        call doesn't crash the turn."""
         survivors = state.get("survivors") or []
-        for call in survivors:
-            try:
-                dispatch_tool_call(self.api, call)
-            except (RuntimeError, KeyError, TypeError, ValueError):
-                continue
-        return {"survivors": []}
+        forced = state.get("forced_calls") or []
+        self._dispatch_all([*survivors, *forced])
+        return {"survivors": [], "forced_calls": []}
 
     def _step(self, state: GraphState) -> GraphState:
         """Advance the world by `step_days` and refresh `day`."""
