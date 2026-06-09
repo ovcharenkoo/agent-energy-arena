@@ -48,7 +48,11 @@ class ConservativeAgent(BaseAgent):
             tile for tile in state["tiles"] if tile["type"] == "coal_plant" and tile["operational"]
         ]
         if failure_active and not operational_coal:
-            self._build_emergency_coal(state)
+            # A late-game failure is evidence that reliability risk has
+            # become recurring. Keep the backup so the city can survive the
+            # stacked endgame instead of trying to finance another plant
+            # after outage penalties have already drained the treasury.
+            self._build_emergency_coal(state, permanent=int(state["day"]) >= 300)
             return
         if (
             not failure_active
