@@ -89,6 +89,17 @@ TILE_CATALOG: dict[str, TileSpec] = {
         requires_road=False,
         description="Boosts happiness; no road requirement.",
     ),
+    "demand_response_hub": TileSpec(
+        tile_type="demand_response_hub",
+        capex=30_000,
+        opex_per_day=60,
+        requires_road=False,
+        description=(
+            "Automated smart-grid control. Reduces civilian electricity "
+            "demand by 15% from 09:00-20:00; city-wide reduction capped "
+            "at 30%. No road requirement."
+        ),
+    ),
     "pipeline": TileSpec(
         tile_type="pipeline",
         capex=2_000,

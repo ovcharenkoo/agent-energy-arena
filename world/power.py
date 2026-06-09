@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 from world import workforce
 from world.catalog import TILE_CATALOG
+from world.demand_response import apply_demand_response
 from world.event_effects import demand_surprise_ic_mult, heatwave_residential_mult
 from world.snapshots import BalanceState, WeatherNow
 from world.weather import P_solar_kw, turbine_kw
@@ -130,7 +131,7 @@ def total_demand_kw(state: WorldState, h: int) -> float:
         demand_surprise_ic_mult(state)
     )
     process = _process_loads_kw(state)
-    return float(res + ic + process)
+    return float(apply_demand_response(state, h, res + ic) + process)
 
 
 # -- Dispatch ----------------------------------------------------------------
